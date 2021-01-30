@@ -7,7 +7,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional
 
-import torch
+from classy_vision.generic.util import log_class_usage
 
 from .param_scheduler import (
     ClassyParamScheduler,
@@ -80,6 +80,7 @@ class ClassyOptimizer(ABC):
         self.options_view = OptionsView(self)
         self.optimizer = None
         self._param_group_schedulers = None
+        log_class_usage("Optimizer", self.__class__)
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "ClassyOptimizer":
@@ -164,7 +165,7 @@ class ClassyOptimizer(ABC):
 
         If UpdateInterval is None, updates all schedulers, regardless whether
         they are configured as epoch or step. Returns a list of dictionaries in
-        the param_groups format. """
+        the param_groups format."""
 
         param_groups = []
         for pg in self._param_group_schedulers:
@@ -207,19 +208,6 @@ class ClassyOptimizer(ABC):
         This is used to load the state of the optimizer from a checkpoint.
         """
         self.optimizer.load_state_dict(state["optim"])
-
-    def backward(self, loss: torch.Tensor) -> None:
-        """
-        Computer gradients with respect to the loss.
-
-        Calls :func:`zero_grad` and then computes the gradient using
-        `torch.Tensor.backward <https://pytorch.org/docs/stable/
-        tensors.html#torch.Tensor.backward>`_. See :mod:`torch.autograd` for
-        more information.
-        """
-        # TODO (aadcock): Add gradient accumulation logic
-        self.zero_grad()
-        loss.backward()
 
     def on_epoch(self, where: float) -> None:
         """

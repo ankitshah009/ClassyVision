@@ -369,7 +369,7 @@ class RegNetParams:
         self.relu_in_place = RELU_IN_PLACE
 
     def get_expanded_params(self):
-        """ Programatically compute all the per-block settings,
+        """Programatically compute all the per-block settings,
         given the RegNet parameters.
 
         The first step is to compute the quantized linear block parameters,
@@ -536,14 +536,6 @@ class RegNet(ClassyModel):
             elif isinstance(m, nn.Linear):
                 m.weight.data.normal_(mean=0.0, std=0.01)
                 m.bias.data.zero_()
-
-    @property
-    def input_shape(self):
-        return (3, 224, 224)
-
-    @property
-    def model_depth(self):
-        return self.stem.depth + self.trunk_depth
 
 
 # Register some "classic" RegNets

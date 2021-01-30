@@ -17,7 +17,7 @@ from . import register_meter
 @register_meter("accuracy")
 class AccuracyMeter(ClassyMeter):
     """Meter to calculate top-k accuracy for single label/ multi label
-       image classification task.
+    image classification task.
     """
 
     def __init__(self, topk):
@@ -25,6 +25,8 @@ class AccuracyMeter(ClassyMeter):
         args:
             topk: list of int `k` values.
         """
+        super().__init__()
+
         assert isinstance(topk, list), "topk must be a list"
         assert len(topk) > 0, "topk list should have at least one element"
         assert [is_pos_int(x) for x in topk], "each value in topk must be >= 1"
@@ -96,8 +98,7 @@ class AccuracyMeter(ClassyMeter):
         }
 
     def get_classy_state(self):
-        """Contains the states of the meter.
-        """
+        """Contains the states of the meter."""
         return {
             "name": self.name,
             "top_k": self._topk,
@@ -138,7 +139,12 @@ class AccuracyMeter(ClassyMeter):
         # Convert target to 0/1 encoding if isn't
         target = maybe_convert_to_one_hot(target, model_output)
 
-        _, pred = model_output.topk(max(self._topk), dim=1, largest=True, sorted=True)
+        # If Pytorch AMP is being used, model outputs are probably fp16
+        # Since .topk() is not compatible with fp16, we promote the model outputs to full precision
+        _, pred = model_output.float().topk(
+            max(self._topk), dim=1, largest=True, sorted=True
+        )
+
         for i, k in enumerate(self._topk):
             self._curr_correct_predictions_k[i] += (
                 torch.gather(target, dim=1, index=pred[:, :k])

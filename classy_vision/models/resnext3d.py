@@ -4,6 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from typing import Any, Dict
 
 import torch
@@ -174,7 +175,7 @@ class ResNeXt3DBase(ClassyModel):
                 nn.init.normal_(m.weight, mean=0.0, std=0.01)
                 nn.init.constant_(m.bias, 0)
 
-    def set_classy_state(self, state):
+    def set_classy_state(self, state, strict=True):
         # We need to support both regular checkpoint loading and 2D conv weight
         # inflation into 3D conv weight in this function.
         self.load_head_states(state)
@@ -185,9 +186,10 @@ class ResNeXt3DBase(ClassyModel):
 
         current_state = self.state_dict()
         for name, weight_src in state["model"]["trunk"].items():
-            assert name in current_state, (
-                "weight %s is not found in ResNeXt3D model" % name
-            )
+            if name not in current_state:
+                logging.warn(f"weight {name} is not found in current ResNeXt3D state")
+                continue
+
             weight_tgt = current_state[name]
             assert (
                 weight_src.dim() == weight_tgt.dim()
@@ -222,7 +224,7 @@ class ResNeXt3DBase(ClassyModel):
                 )
 
             current_state[name] = weight_src.clone()
-        self.load_state_dict(current_state)
+        self.load_state_dict(current_state, strict=strict)
 
         # set the heads back again
         self.set_heads(attached_heads)
@@ -275,10 +277,6 @@ class ResNeXt3DBase(ClassyModel):
             self.clip_crop_size,
             self.clip_crop_size,
         )
-
-    @property
-    def model_depth(self):
-        return sum(self.num_blocks)
 
     @property
     def input_key(self):

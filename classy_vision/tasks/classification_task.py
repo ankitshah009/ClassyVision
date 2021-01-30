@@ -4,6 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import copy
 import enum
 import json
@@ -27,6 +28,7 @@ from classy_vision.generic.util import (
     Timer,
     copy_model_to_gpu,
     load_and_broadcast_checkpoint,
+    master_params,
     recursive_copy_to_gpu,
     split_batchnorm_params,
     update_classy_state,
@@ -52,6 +54,18 @@ try:
     apex_available = True
 except ImportError:
     apex_available = False
+
+try:
+    from torch.cuda.amp import GradScaler as TorchGradScaler
+
+except ImportError:
+    pass
+
+
+class AmpType(enum.Enum):
+    # Automatic Mixed Precision supported types
+    APEX = enum.auto()
+    PYTORCH = enum.auto()
 
 
 class BroadcastBuffersMode(enum.Enum):
@@ -123,11 +137,14 @@ class ClassificationTask(ClassyTask):
     :var data_iterator: Iterator which can be used to obtain batches
     :var losses: Loss curve
     :var perf_log: list of training speed measurements, to be logged
+    :var clip_grad_norm: maximum gradient norm (default None)
+    :var simulated_global_batchsize: batch size simulated via gradient accumulation
+    :var optimizer_period: apply optimizer after this many steps; derived from
+        simulated_global_batchsize, default 1.
     """
 
     def __init__(self):
-        """Constructs a ClassificationTask
-        """
+        """Constructs a ClassificationTask"""
         super().__init__()
 
         self.base_loss = None
@@ -157,6 +174,8 @@ class ClassificationTask(ClassyTask):
             BroadcastBuffersMode.BEFORE_EVAL
         )
         self.amp_args = None
+        self.amp_type = None
+        self.amp_grad_scaler = None
         self.mixup_transform = None
         self.perf_log = []
         self.last_batch = None
@@ -166,6 +185,10 @@ class ClassificationTask(ClassyTask):
         self.dataloader_mp_context = "spawn"
         self.bn_weight_decay = False
         self._train_only = True
+        self.clip_grad_norm = None
+        self.simulated_global_batchsize = None
+        self.optimizer_period = 1
+        self.ddp_bucket_cap_mb = 25
 
     def set_use_gpu(self, use_gpu: bool):
         self.use_gpu = use_gpu
@@ -174,6 +197,30 @@ class ClassificationTask(ClassyTask):
             not self.use_gpu or torch.cuda.is_available()
         ), "CUDA required to train on GPUs"
 
+        return self
+
+    def set_clip_grad_norm(self, clip_grad_norm: Optional[float]):
+        """Sets maximum gradient norm.
+
+        None means gradient clipping is disabled. Defaults to None."""
+        self.clip_grad_norm = clip_grad_norm
+        if clip_grad_norm is None:
+            logging.info("Disabled gradient norm clipping.")
+        else:
+            logging.info(
+                f"Enabled gradient norm clipping with threshold: {clip_grad_norm}"
+            )
+        return self
+
+    def set_simulated_global_batchsize(self, simulated_global_batchsize: Optional[int]):
+        """Sets a simulated batch size by gradient accumulation.
+
+        Gradient accumulation adds up gradients from multiple minibatches and
+        steps the optimizer every N train_steps, where N is optimizer_period.
+        When enabled, the very last train_steps might end up not updating the
+        model, depending on the number of total steps. None means gradient
+        accumulation is disabled. Defaults to None."""
+        self.simulated_global_batchsize = simulated_global_batchsize
         return self
 
     def set_checkpoint(self, checkpoint_path: str):
@@ -275,6 +322,7 @@ class ClassificationTask(ClassyTask):
         batch_norm_sync_mode: BatchNormSyncMode = BatchNormSyncMode.DISABLED,
         batch_norm_sync_group_size: int = 0,
         find_unused_parameters: bool = True,
+        bucket_cap_mb: int = 25,
     ):
         """Set distributed options.
 
@@ -289,7 +337,8 @@ class ClassificationTask(ClassyTask):
                 usually 8).
             find_unused_parameters: See
                 :class:`torch.nn.parallel.DistributedDataParallel` for information.
-
+            bucket_cap_mb: See
+                :class:`torch.nn.parallel.DistributedDataParallel` for information.
         Raises:
             RuntimeError: If batch_norm_sync_mode is `BatchNormSyncMode.APEX` and apex
                 is not installed.
@@ -318,6 +367,7 @@ class ClassificationTask(ClassyTask):
         self.batch_norm_sync_mode = batch_norm_sync_mode
 
         self.find_unused_parameters = find_unused_parameters
+        self.ddp_bucket_cap_mb = bucket_cap_mb
 
         return self
 
@@ -390,8 +440,28 @@ class ClassificationTask(ClassyTask):
         if amp_args is None:
             logging.info("AMP disabled")
         else:
-            if not apex_available:
-                raise RuntimeError("apex is not installed, cannot enable amp")
+            # Check that the requested AMP type is known
+            try:
+                self.amp_type = AmpType[self.amp_args["amp_type"].upper()]
+            except KeyError:
+                logging.info("AMP type not specified, defaulting to Apex")
+                self.amp_type = AmpType.APEX
+
+            # Check for CUDA availability, required for both Apex and Pytorch AMP
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "AMP is required but CUDA is not supported, cannot enable AMP"
+                )
+
+            # Check for Apex availability
+            if self.amp_type == AmpType.APEX and not apex_available:
+                raise RuntimeError(
+                    "Apex AMP is required but Apex is not installed, cannot enable AMP"
+                )
+
+            # Set Torch AMP grad scaler, used to prevent gradient underflow
+            elif self.amp_type == AmpType.PYTORCH:
+                self.amp_grad_scaler = TorchGradScaler()
 
             logging.info(f"AMP enabled with args {amp_args}")
         return self
@@ -475,6 +545,7 @@ class ClassificationTask(ClassyTask):
             "find_unused_parameters": distributed_config.get(
                 "find_unused_parameters", True
             ),
+            "bucket_cap_mb": distributed_config.get("bucket_cap_mb", 25),
         }
 
         task = (
@@ -490,6 +561,8 @@ class ClassificationTask(ClassyTask):
             .set_distributed_options(**distributed_options)
             .set_hooks(hooks)
             .set_bn_weight_decay(config.get("bn_weight_decay", False))
+            .set_clip_grad_norm(config.get("clip_grad_norm"))
+            .set_simulated_global_batchsize(config.get("simulated_global_batchsize"))
         )
 
         if not test_only:
@@ -511,34 +584,29 @@ class ClassificationTask(ClassyTask):
 
     @property
     def num_batches_per_phase(self):
-        """Returns number of batches in current phase iterator
-        """
+        """Returns number of batches in current phase iterator"""
         return len(self.data_iterator)
 
     @property
     def model(self):
-        """Returns model used in training (can be wrapped with DDP)
-        """
+        """Returns model used in training (can be wrapped with DDP)"""
         return (
             self.distributed_model if is_distributed_training_run() else self.base_model
         )
 
     @property
     def loss(self):
-        """Returns loss used in training (can be wrapped with DDP)
-        """
+        """Returns loss used in training (can be wrapped with DDP)"""
         return self.distributed_loss if self.distributed_loss else self.base_loss
 
     @property
     def phase_type(self):
-        """Returns current phase type. String with value "train" or "test"
-        """
+        """Returns current phase type. String with value "train" or "test" """
         return "train" if self.train else "test"
 
     @property
     def eval_phase_idx(self):
-        """Returns current evaluation phase
-        """
+        """Returns current evaluation phase"""
         return self.phase_idx - self.train_phase_idx - 1
 
     def get_total_training_phases(self):
@@ -672,19 +740,36 @@ class ClassificationTask(ClassyTask):
             )
 
         if self.amp_args is not None:
-            # Initialize apex.amp. This updates the model and the PyTorch optimizer (
-            # if training, which is wrapped by the ClassyOptimizer in self.optimizer).
-            # Please note this must happen before loading the checkpoint, cause
-            # there's amp state to be restored.
+            if self.amp_type == AmpType.APEX:
+                # Initialize apex.amp. This updates the model and the PyTorch optimizer (
+                # if training, which is wrapped by the ClassyOptimizer in self.optimizer).
+                # Please note this must happen before loading the checkpoint, cause
+                # there's amp state to be restored.
+                if self.optimizer is None:
+                    self.base_model = apex.amp.initialize(
+                        self.base_model, optimizers=None, **self.amp_args
+                    )
+                else:
+                    self.base_model, self.optimizer.optimizer = apex.amp.initialize(
+                        self.base_model, self.optimizer.optimizer, **self.amp_args
+                    )
 
-            if self.optimizer is None:
-                self.base_model = apex.amp.initialize(
-                    self.base_model, optimizers=None, **self.amp_args
+        if self.simulated_global_batchsize is not None:
+            if self.simulated_global_batchsize % self.get_global_batchsize() != 0:
+                raise ValueError(
+                    f"Global batch size ({self.get_global_batchsize()}) must divide "
+                    f"simulated_global_batchsize ({self.simulated_global_batchsize})"
                 )
-            else:
-                self.base_model, self.optimizer.optimizer = apex.amp.initialize(
-                    self.base_model, self.optimizer.optimizer, **self.amp_args
-                )
+        else:
+            self.simulated_global_batchsize = self.get_global_batchsize()
+
+        self.optimizer_period = (
+            self.simulated_global_batchsize // self.get_global_batchsize()
+        )
+        if self.optimizer_period > 1:
+            logging.info(
+                f"Using gradient accumulation with a period of {self.optimizer_period}"
+            )
 
         if self.checkpoint_path:
             self.checkpoint_dict = load_and_broadcast_checkpoint(self.checkpoint_path)
@@ -724,6 +809,7 @@ class ClassificationTask(ClassyTask):
             self.base_model,
             broadcast_buffers=broadcast_buffers,
             find_unused_parameters=self.find_unused_parameters,
+            bucket_cap_mb=self.ddp_bucket_cap_mb,
         )
         if (
             isinstance(self.base_loss, ClassyLoss)
@@ -734,6 +820,7 @@ class ClassificationTask(ClassyTask):
                 self.base_loss,
                 broadcast_buffers=broadcast_buffers,
                 find_unused_parameters=self.find_unused_parameters,
+                bucket_cap_mb=self.ddp_bucket_cap_mb,
             )
 
     @property
@@ -790,7 +877,12 @@ class ClassificationTask(ClassyTask):
         if isinstance(self.base_loss, ClassyLoss):
             classy_state_dict["loss"] = self.base_loss.get_classy_state()
         if self.amp_args is not None:
-            classy_state_dict["amp"] = apex.amp.state_dict()
+            if self.amp_type == AmpType.APEX:
+                classy_state_dict["amp"] = apex.amp.state_dict()
+
+            elif self.amp_grad_scaler is not None:
+                classy_state_dict["amp"] = self.amp_grad_scaler.state_dict()
+
         if deep_copy:
             classy_state_dict = copy.deepcopy(classy_state_dict)
         return classy_state_dict
@@ -818,7 +910,10 @@ class ClassificationTask(ClassyTask):
             self.base_loss.set_classy_state(state["loss"])
 
         if "amp" in state:
-            apex.amp.load_state_dict(state["amp"])
+            if self.amp_type == AmpType.APEX:
+                apex.amp.load_state_dict(state["amp"])
+            else:
+                self.amp_grad_scaler.load_state_dict(state["amp"])
 
         for hook in self.hooks:
             # we still want to be able to run when new hooks are added or old
@@ -855,7 +950,14 @@ class ClassificationTask(ClassyTask):
         if self.use_gpu:
             sample = recursive_copy_to_gpu(sample, non_blocking=True)
 
-        with torch.no_grad():
+        # Optional Pytorch AMP context
+        torch_amp_context = (
+            torch.cuda.amp.autocast()
+            if self.amp_type == AmpType.PYTORCH
+            else contextlib.suppress()
+        )
+
+        with torch.no_grad(), torch_amp_context:
             output = self.model(sample["input"])
 
             local_loss = self.compute_loss(output, sample)
@@ -903,31 +1005,25 @@ class ClassificationTask(ClassyTask):
         if self.mixup_transform is not None:
             sample = self.mixup_transform(sample)
 
-        with torch.enable_grad():
-            # Forward pass
+        # Optional Pytorch AMP context
+        torch_amp_context = (
+            torch.cuda.amp.autocast()
+            if self.amp_type == AmpType.PYTORCH
+            else contextlib.suppress()
+        )
+
+        # Forward pass
+        with torch.enable_grad(), torch_amp_context:
             output = self.model(sample["input"])
 
             local_loss = self.compute_loss(output, sample)
-
             loss = local_loss.detach().clone()
-
             self.losses.append(loss.data.cpu().item() * target.size(0))
 
             self.update_meters(output, sample)
 
-        # Run backwards pass / update optimizer
-        if self.amp_args is not None:
-            self.optimizer.zero_grad()
-            with apex.amp.scale_loss(
-                local_loss, self.optimizer.optimizer
-            ) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            self.optimizer.backward(local_loss)
-
-        self.check_inf_nan(loss)
-
-        self.optimizer.step(where=self.where)
+        # Backwards pass + optimizer step
+        self.run_optimizer(local_loss)
 
         self.num_updates += self.get_global_batchsize()
 
@@ -942,6 +1038,68 @@ class ClassificationTask(ClassyTask):
 
     def compute_loss(self, model_output, sample):
         return self.loss(model_output, sample["target"])
+
+    def run_optimizer(self, loss):
+        """Runs backwards pass and update the optimizer"""
+
+        self.check_inf_nan(loss)
+
+        # Gradient accumulation logic. We always set optimizer_period, even
+        # if gradient accumulation is disabled. Assumes all batches have the
+        # same size
+        update_idx = self.num_updates // self.get_global_batchsize()
+        do_zero_grad = (update_idx % self.optimizer_period) == 0
+        do_step = (update_idx % self.optimizer_period) == self.optimizer_period - 1
+
+        if do_zero_grad:
+            self.optimizer.zero_grad()
+
+        # only sync with DDP when we need to perform an optimizer step
+        ctx_mgr_model = (
+            self.distributed_model.no_sync()
+            if self.distributed_model is not None and not do_step
+            else contextlib.suppress()
+        )
+        ctx_mgr_loss = (
+            self.distributed_loss.no_sync()
+            if self.distributed_loss is not None and not do_step
+            else contextlib.suppress()
+        )
+
+        with ctx_mgr_model, ctx_mgr_loss:
+            if self.amp_type == AmpType.APEX:
+                with apex.amp.scale_loss(loss, self.optimizer.optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            elif self.amp_type == AmpType.PYTORCH:
+                self.amp_grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+        if do_step:
+            # Handle gradient accumulation related gradient rescaling
+            if self.optimizer_period != 1:
+                self._rescale_gradients(1 / self.optimizer_period)
+
+            # Clipping must happen after grad accumulation
+            if self.clip_grad_norm is not None:
+                self._clip_gradients(self.clip_grad_norm)
+
+            if self.amp_type == AmpType.PYTORCH:
+                # If using mixed precision, handle underflow-related scaling
+                # See https://pytorch.org/docs/stable/amp.html#gradient-scaling
+                # for context
+                self.amp_grad_scaler.step(self.optimizer, where=self.where)
+                self.amp_grad_scaler.update()
+            else:
+                self.optimizer.step(where=self.where)
+
+    def _rescale_gradients(self, scale):
+        for param in master_params(self.optimizer):
+            if param.grad is not None:
+                param.grad.data.mul_(scale)
+
+    def _clip_gradients(self, max_norm):
+        nn.utils.clip_grad_norm_(master_params(self.optimizer), max_norm)
 
     def update_meters(self, model_output, sample):
         target = sample["target"].detach().cpu()
@@ -988,21 +1146,18 @@ class ClassificationTask(ClassyTask):
         self._set_model_train_mode()
 
     def done_training(self):
-        """Stop condition for training
-        """
+        """Stop condition for training"""
         return self.phase_idx + 1 >= len(self.phases)
 
     def create_data_iterators(self):
-        """Creates data iterator(s) for the current phase.
-        """
+        """Creates data iterator(s) for the current phase."""
         # Delete iterator explicitly so that all dataloader processes
         # are cleaned up.
         del self.data_iterator
         self.data_iterator = iter(self.dataloader)
 
     def _set_model_train_mode(self):
-        """Set train mode for model
-        """
+        """Set train mode for model"""
         phase = self.phases[self.phase_idx]
         self.base_model.train(phase["train"])
         self.base_loss.train(phase["train"])
@@ -1026,13 +1181,11 @@ class ClassificationTask(ClassyTask):
     # TODO: Functions below should be better abstracted into the dataloader
     # abstraction
     def get_batchsize_per_replica(self):
-        """Return local replica's batchsize for dataset (e.g. batchsize per GPU)
-        """
+        """Return local replica's batchsize for dataset (e.g. batchsize per GPU)"""
         return self.datasets[self.phase_type].get_batchsize_per_replica()
 
     def get_global_batchsize(self):
-        """Return global batchsize across all trainers
-        """
+        """Return global batchsize across all trainers"""
         return self.datasets[self.phase_type].get_global_batchsize()
 
     def on_start(self):

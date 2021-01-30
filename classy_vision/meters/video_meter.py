@@ -27,6 +27,7 @@ class VideoMeter(ClassyMeter):
             clips_per_video_train: No. of clips sampled per video at train time
             clips_per_video_test: No. of clips sampled per video at test time
         """
+        super().__init__()
 
         self._clips_per_video_train = clips_per_video_train
         self._clips_per_video_test = clips_per_video_test
@@ -51,8 +52,7 @@ class VideoMeter(ClassyMeter):
         raise NotImplementedError
 
     def get_classy_state(self):
-        """Contains the states of the meter.
-        """
+        """Contains the states of the meter."""
         state = {}
         state["meter_state"] = self.meter.get_classy_state()
         state["name"] = self.name

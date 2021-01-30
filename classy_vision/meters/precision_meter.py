@@ -26,6 +26,8 @@ class PrecisionAtKMeter(ClassyMeter):
         args:
             topk: list of int `k` values.
         """
+        super().__init__()
+
         assert isinstance(topk, list), "topk must be a list"
         assert len(topk) > 0, "topk list should have at least one element"
         assert [is_pos_int(x) for x in topk], "each value in topk must be >= 1"
@@ -97,8 +99,7 @@ class PrecisionAtKMeter(ClassyMeter):
         }
 
     def get_classy_state(self):
-        """Contains the states of the meter.
-        """
+        """Contains the states of the meter."""
         return {
             "name": self.name,
             "top_k": self._topk,
